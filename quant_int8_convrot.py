@@ -34,6 +34,18 @@ FP8 = (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None
 def best_gs(k):
     return next((g for g in VALID_GS if k % g == 0), None)
 
+# Token-embedding lookup tables -> per-row int8 (+rotation). Match real token tables
+# (embed_tokens / embed_tokens_per_layer / wte / ...), not an `*.embedding_projection`.
+EMBED_SEG = re.compile(r"^(embed_tokens(_per_layer)?|token_embedding|word_embeddings|tok_embeddings|wte|shared)$")
+
+def is_token_embedding(key, shape):
+    if len(shape) != 2:
+        return False
+    n, k = shape
+    if n < 4096 or n <= k:            # vocab-sized table (rows >> cols)
+        return False
+    return any(EMBED_SEG.match(s) for s in key.split("."))
+
 # safe_open-compatible reader for torch pickle checkpoints (weights_only=True -> safe load, no code
 # execution; whole file into RAM since pickle has no lazy access).
 _DTYPE_CODE = {torch.float16: "F16", torch.bfloat16: "BF16", torch.float32: "F32",
@@ -155,6 +167,25 @@ def cq_tensor(gs):
     cfg = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": gs}
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
+@torch.no_grad()
+def quantize_embedding(w, gs, device="cuda", chunk=32768):
+    """Rotated per-row int8 for token-embedding tables. Rotation Gaussianizes each row, tightening
+    its absmax (~half the error for free). The runtime un-rotates after the lookup, since a lookup
+    has no GEMM to fold the inverse into. gs=None -> plain absmax per-row int8 (no rotation).
+    Chunked over rows so a ~1B-element vocab table never lands fully on the GPU."""
+    h = _build_hadamard(gs, device=device, dtype=torch.float32) if gs else None
+    qs, ss = [], []
+    for i in range(0, w.shape[0], chunk):
+        wf = w[i:i + chunk].to(device, torch.float32)
+        wr = _rotate_weight(wf, h, gs) if h is not None else wf
+        scale = (wr.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-30)
+        q = (wr / scale).round().clamp(-127, 127)
+        qs.append(q.to(torch.int8).cpu())
+        ss.append(scale.to(torch.float32).cpu())
+        del wf, wr, q, scale
+        torch.cuda.empty_cache()
+    return torch.cat(qs), torch.cat(ss)
+
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -167,7 +198,11 @@ def main():
     ap.add_argument("--min-gemm", type=int, default=256,
                     help="skip a layer if min(N,K) < this (default 256: a GEMM whose small side is "
                          "under ~256 never beats bf16 at any M, so int8 is pure overhead). --min-gemm 0 disables.")
-    ap.add_argument("--mseclip", action="store_true", help="MSE-optimal clip instead of absmax (~2-3%% lower weight error, but a proxy — validate output before trusting it)")
+    ap.add_argument("--quant-embeddings", action=argparse.BooleanOptionalAction, default=True,
+                    help="quantize token-embedding tables (embed_tokens, embed_tokens_per_layer, ...) "
+                         "per-ROW int8 (+rotation); ON by default (often the biggest size win). "
+                         "--no-quant-embeddings keeps them bf16.")
+    ap.add_argument("--mseclip", action="store_true", help="MSE-optimal clip instead of absmax for the CONVROT linears only (embeddings always absmax) (~2-3%% lower weight error, but a proxy — validate output before trusting it)")
     ap.add_argument("--downcast-fp32", action="store_true", help="downcast stray fp32 passthrough linears to compute dtype")
     ap.add_argument("--warn-thresh", type=float, default=2.0, help="warn on any quantized layer whose relerr%% exceeds this (default 2.0)")
     ap.add_argument("--verify-report", default=None, help="write the full per-layer (relerr, cos, gs) table to this path")
@@ -192,13 +227,20 @@ def main():
         target = torch.float16 if dtc.get("F16", 0) >= dtc.get("BF16", 0) and dtc.get("F16", 0) else torch.bfloat16
 
         # ---- plan ----
-        plan = []           # (base, shape, gs)
+        plan = []           # (base, shape, gs)  block linears -> int8+convrot
+        eplan = []          # (base, shape)      token embeddings -> per-row int8
         skip = collections.Counter()
         for key in keys:
             if not key.endswith(".weight"):
                 continue
             base = key[:-len(".weight")]
             shape = tuple(st.get_slice(key).get_shape())
+            if is_token_embedding(base, shape):
+                if args.quant_embeddings and not (exc and exc.search(base)):
+                    eplan.append((base, shape))
+                else:
+                    skip["embedding(--no-quant-embeddings/excluded)"] += 1
+                continue
             q, reason = classify(base, shape)
             if exc and exc.search(base):
                 q, reason = False, "excluded(flag)"
@@ -228,6 +270,12 @@ def main():
             print(f"  x{c:<4d} gs{gs:<3d} {str(shape):16s} {pat}")
         gsdist = collections.Counter(gs for _, _, gs in plan)
         print(f"  groupsizes: {dict(gsdist)}   quantized params: {qparams/1e9:.2f}B  (~{qparams/1e9:.1f} GB int8)")
+        if eplan:
+            ep = sum(s[0] * s[1] for _, s in eplan)
+            print(f"\nEMBEDDINGS {len(eplan)} table(s) per-row int8 (+rotation):")
+            for b, s in eplan:
+                print(f"  {str(s):20s} {b}")
+            print(f"  embedding params: {ep/1e9:.2f}B  (~{ep/1e9:.1f} GB int8, saves ~{ep/1e9:.1f} GB vs bf16)")
         print(f"\nLEAVE AS-IS ({sum(skip.values())} weights):")
         for reason, c in skip.most_common():
             print(f"  x{c:<4d} {reason}")
@@ -237,6 +285,7 @@ def main():
 
         # ---- execute ----
         quant_set = {b for b, _, _ in plan}
+        embed_set = {b for b, _ in eplan}
         out = {}
         nq = 0
         t0 = time.time()
@@ -257,6 +306,34 @@ def main():
                 w = t.float()
             else:
                 w = t
+            if base in embed_set:
+                egs = best_gs(w.shape[1])                  # rotate if the row dim allows it
+                qd, scale = quantize_embedding(w, egs)
+                # relerr, chunked with f64 accumulation (a single fp32 .norm() over a ~1B-element
+                # vocab table accumulates enough error to misreport by >0.1pp)
+                h_e = _build_hadamard(egs, device="cuda", dtype=torch.float32) if egs else None
+                se = sw = 0.0
+                for i in range(0, w.shape[0], 32768):
+                    wf = w[i:i + 32768].to("cuda", torch.float32)
+                    dq = qd[i:i + 32768].to("cuda").float() * scale[i:i + 32768].to("cuda")
+                    if h_e is not None:
+                        dq = _rotate_weight(dq, h_e, egs)   # un-rotate to compare against source
+                    se += ((dq - wf) ** 2).sum().double().item()
+                    sw += (wf ** 2).sum().double().item()
+                    del wf, dq
+                torch.cuda.empty_cache()
+                relerr = (se / sw) ** 0.5 * 100.0
+                rot = f"rotated gs{egs} + " if egs else ""
+                print(f"  embedding {base} {tuple(w.shape)} {rot}per-row int8 relerr={relerr:.3f}%", flush=True)
+                ecfg = {"format": "int8_tensorwise"}
+                if egs is not None:
+                    ecfg["convrot"] = True
+                    ecfg["convrot_groupsize"] = egs
+                out[key] = qd
+                out[f"{base}.weight_scale"] = scale
+                out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(ecfg).encode("utf-8")), dtype=torch.uint8)
+                torch.cuda.empty_cache()
+                continue
             if base in quant_set:
                 gs = best_gs(w.shape[1])
                 qd, scale = quantize_convrot(w, gs, mseclip=args.mseclip)

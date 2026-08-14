@@ -168,6 +168,24 @@ def cq_tensor(gs):
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
 @torch.no_grad()
+def quantize_w4a8(w, device="cuda"):
+    """W4A8 (asym_w4a8_int8): ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group
+    scales; activations quantize to int8 at runtime. Needs weight dim K divisible by 256 and N>=64.
+    Returns (out-tensor dict, comfy_quant cfg, relerr%)."""
+    from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
+    wf = w.to(device, torch.bfloat16)
+    q, p = AsymW4A8Int8Layout.quantize(
+        wf, group_size=16, convrot_groupsize=256,
+        scale_dtype=torch.float8_e4m3fn, codebook=True, stochastic_rounding=0)
+    deq = QuantizedTensor(q, "AsymW4A8Int8Layout", p).dequantize()
+    tensors = {"weight": q.cpu(), "weight_s_rel": p.scale.cpu(), "weight_s_channel": p.s_channel.cpu()}
+    if p.codebook is not None:
+        tensors["weight_codebook"] = p.codebook.cpu()
+    cfg = {"format": "asym_w4a8_int8", "group_size": 16, "convrot": True, "convrot_groupsize": 256}
+    relerr = ((deq.float() - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
+    return tensors, cfg, relerr
+
+@torch.no_grad()
 def quantize_embedding(w, gs, device="cuda", chunk=32768):
     """Rotated per-row int8 for token-embedding tables. Rotation Gaussianizes each row, tightening
     its absmax (~half the error for free). The runtime un-rotates after the lookup, since a lookup
@@ -193,6 +211,10 @@ def main():
     ap.add_argument("dst", nargs="?", help="output .safetensors; if omitted, derived from SRC by "
                     "replacing bf16/fp16/fp32 with int8_convrot (or appending _int8_convrot)")
     ap.add_argument("--dry-run", action="store_true", help="report the plan, write nothing")
+    ap.add_argument("--w4a8", action="store_true",
+                    help="quantize eligible block linears as W4A8 (asym_w4a8_int8: int4 weight + codebook "
+                         "+ fp8 scales, int8 activations) instead of int8. Layers with K not divisible by "
+                         "256 or N<64 fall back to int8; embeddings stay int8.")
     ap.add_argument("--exclude", default=None, help="regex; matching layers are FORCED to passthrough")
     ap.add_argument("--include", default=None, help="regex; matching eligible layers are FORCED to quantize")
     ap.add_argument("--min-gemm", type=int, default=256,
@@ -210,9 +232,10 @@ def main():
     if not args.dst and not args.dry_run:
         # derive dst from src: swap dtype token for int8_convrot (else append), always .safetensors
         base = os.path.splitext(os.path.basename(args.src))[0]
-        new = re.sub(r"(?i)(bf16|fp16|fp32)", "int8_convrot", base)
+        tag = "w4a8_convrot" if args.w4a8 else "int8_convrot"
+        new = re.sub(r"(?i)(bf16|fp16|fp32)", tag, base)
         if new == base:
-            new = base + "_int8_convrot"
+            new = base + "_" + tag
         args.dst = os.path.join(os.path.dirname(args.src), new + ".safetensors")
         print(f"auto dst -> {args.dst}")
     exc = re.compile(args.exclude) if args.exclude else None
@@ -264,7 +287,9 @@ def main():
             qparams += shape[0] * shape[1]
         print(f"SRC {args.src}")
         print(f"compute/passthrough dtype: {target}")
-        print(f"\nQUANTIZE {len(plan)} layers (int8+convrot, {'MSE-clip' if args.mseclip else 'absmax'}):")
+        fmt_label = ("W4A8+convrot (int8 fallback for K%256!=0 or N<64)" if args.w4a8
+                     else f"int8+convrot, {'MSE-clip' if args.mseclip else 'absmax'}")
+        print(f"\nQUANTIZE {len(plan)} layers ({fmt_label}):")
         for pat in sorted(by_pat):
             c, shape, gs = by_pat[pat]
             print(f"  x{c:<4d} gs{gs:<3d} {str(shape):16s} {pat}")
@@ -334,7 +359,18 @@ def main():
                 out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(ecfg).encode("utf-8")), dtype=torch.uint8)
                 torch.cuda.empty_cache()
                 continue
-            if base in quant_set:
+            if base in quant_set and args.w4a8 and best_gs(w.shape[1]) == 256 and w.shape[0] >= 64:
+                tensors, cfg, relerr = quantize_w4a8(w)
+                if relerr > args.warn_thresh:
+                    print(f"  WARN high error: {base} W4A8 relerr={relerr:.2f}%", flush=True)
+                errs.append((relerr, 1.0, 256, base))
+                for suf, val in tensors.items():
+                    out[f"{base}.{suf}"] = val
+                out[f"{base}.comfy_quant"] = torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
+                nq += 1
+                if nq % 100 == 0:
+                    print(f"  {nq}/{len(plan)} ... {base} W4A8 relerr={relerr:.2f}%", flush=True)
+            elif base in quant_set:
                 gs = best_gs(w.shape[1])
                 qd, scale = quantize_convrot(w, gs, mseclip=args.mseclip)
                 cos, relerr = recon_metrics(qd, scale, w, gs)

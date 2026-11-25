@@ -167,11 +167,14 @@ def cq_tensor(gs):
     cfg = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": gs}
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
 
+W_FORMATS = {3: "w3a8_int8", 4: "asym_w4a8_int8", 5: "w5a8_int8", 6: "w6a8_int8"}
+W_WARN = {3: 20.0, 4: 10.0, 5: 6.0, 6: 4.0}     # ~1.4x each width's normal relerr (15 / 7.3 / 4.1 / 2.3 %)
+
 @torch.no_grad()
 def quantize_w4a8(w, bits=4, group_size=None, device="cuda"):
-    """W4A8: ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group
-    scales, or with bits=6 W6A8: uniform int6, no codebook, ~3x lower weight error for
-    1.5x the bytes. Activations quantize to int8 at runtime. Needs K divisible by 256 and N>=64.
+    """W4A8: ConvRot-rotated int4 weight with a Lloyd-Max codebook + fp8 group scales.
+    bits=3 (W3A8) uses an 8-entry codebook; bits=5/6 (W5A8/W6A8) are uniform, no codebook.
+    Activations quantize to int8 at runtime. Needs K divisible by 256 and N>=64.
     Returns (out-tensor dict, comfy_quant cfg, relerr%)."""
     from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
     group_size = group_size or (32 if bits == 6 else 16)
@@ -183,7 +186,7 @@ def quantize_w4a8(w, bits=4, group_size=None, device="cuda"):
     tensors = {"weight": q.cpu(), "weight_s_rel": p.scale.cpu(), "weight_s_channel": p.s_channel.cpu()}
     if p.codebook is not None:
         tensors["weight_codebook"] = p.codebook.cpu()
-    cfg = {"format": "w6a8_int8" if bits == 6 else "asym_w4a8_int8", "group_size": group_size,
+    cfg = {"format": W_FORMATS[bits], "group_size": group_size,
            "convrot": True, "convrot_groupsize": 256}
     relerr = ((deq.float() - wf.float()).norm() / wf.float().norm().clamp(min=1e-30)).item() * 100.0
     return tensors, cfg, relerr
@@ -219,11 +222,17 @@ def main():
                      help="quantize eligible block linears as W4A8 (int4 weight + codebook "
                           "+ fp8 scales, int8 activations) instead of int8. Layers with K not divisible by "
                           "256 or N<64 fall back to int8; embeddings stay int8.")
+    fmt.add_argument("--w3a8", action="store_true",
+                     help="like --w4a8 but 3-bit weights (8-entry codebook): 0.44 bytes/weight at ~2x "
+                          "W4A8's weight error, same speed. Needs comfy-kitchen >= 0.2.42")
+    fmt.add_argument("--w5a8", action="store_true",
+                     help="like --w4a8 but uniform 5-bit weights: ~0.55x W4A8's weight error at 0.69 "
+                          "bytes/weight, same speed. Needs comfy-kitchen >= 0.2.42")
     fmt.add_argument("--w6a8", action="store_true",
                      help="like --w4a8 but uniform 6-bit weights: ~3x lower weight error than "
                           "W4A8 at 0.78 vs 0.56 bytes/weight, same speed")
     ap.add_argument("--group-size", type=int, default=None,
-                    help="columns per fp8 group scale for --w4a8/--w6a8 (default 16 for W4A8, 32 for W6A8)")
+                    help="columns per fp8 group scale for --w3a8/--w4a8/--w5a8/--w6a8 (default 16, 32 for W6A8)")
     ap.add_argument("--exclude", default=None, help="regex; matching layers are FORCED to passthrough")
     ap.add_argument("--include", default=None, help="regex; matching eligible layers are FORCED to quantize")
     ap.add_argument("--min-gemm", type=int, default=256,
@@ -237,13 +246,13 @@ def main():
     ap.add_argument("--downcast-fp32", action="store_true", help="downcast stray fp32 passthrough linears to compute dtype")
     ap.add_argument("--warn-thresh", type=float, default=None,
                     help="warn on any quantized layer whose relerr%% exceeds this (default 2.0 for int8, "
-                         "4.0 for W6A8, 10.0 for W4A8: their normal weight error is ~2.4%% / ~7%%)")
+                         "20 / 10 / 6 / 4 for W3A8 / W4A8 / W5A8 / W6A8: ~1.4x their normal weight error)")
     ap.add_argument("--verify-report", default=None, help="write the full per-layer (relerr, cos, gs) table to this path")
     args = ap.parse_args()
-    bits = 6 if args.w6a8 else 4
-    args.w4a8 = args.w4a8 or args.w6a8       # one grouped-int path below, parametrized by bits
+    bits = 3 if args.w3a8 else 5 if args.w5a8 else 6 if args.w6a8 else 4
+    args.w4a8 = args.w4a8 or args.w3a8 or args.w5a8 or args.w6a8   # one grouped-int path, parametrized by bits
     if args.warn_thresh is None:
-        args.warn_thresh = {4: 10.0, 6: 4.0}[bits] if args.w4a8 else 2.0
+        args.warn_thresh = W_WARN[bits] if args.w4a8 else 2.0
     if not args.dst and not args.dry_run:
         # derive dst from src: swap dtype token for int8_convrot (else append), always .safetensors
         base = os.path.splitext(os.path.basename(args.src))[0]
